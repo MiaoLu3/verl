@@ -130,3 +130,10 @@ logs
 log
 outputs
 .history
+
+
+trajectories
+# noise from SLURM submit scripts
+slurm-*.err
+slurm-*.out
+playground_*/
