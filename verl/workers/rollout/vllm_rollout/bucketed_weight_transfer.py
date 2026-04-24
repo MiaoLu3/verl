@@ -154,7 +154,21 @@ class BucketedWeightSender:
             self._cleanup()
 
     def _init_socket(self):
-        """Initialize ZMQ REQ socket and bind."""
+        """Initialize ZMQ REQ socket and bind.
+
+        PATCH (verl-agent multi-GPU smoke test): remove any stale on-disk unix-socket
+        file at the ipc:// path before bind. Otherwise ZMQ returns EADDRINUSE
+        ("Address already in use") even when no process is listening, which caused
+        multi-GPU agent_loop runs to fail on SLURM nodes where prior jobs left
+        `/tmp/rl-colocate-zmq-GPU-*.sock` files behind.
+        """
+        if self.zmq_handle.startswith("ipc://"):
+            _sock_path = self.zmq_handle[len("ipc://"):]
+            try:
+                if os.path.exists(_sock_path):
+                    os.unlink(_sock_path)
+            except OSError as _e:
+                logger.warning(f"Could not unlink stale ZMQ socket {_sock_path}: {_e}")
         self.socket = self.zmq_context.socket(zmq.REQ)
         self.socket.bind(self.zmq_handle)
 

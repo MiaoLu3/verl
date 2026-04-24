@@ -637,6 +637,13 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
             )
+            # Local patch: expose trajectory step / validate flag to the
+            # agent loop via extra_info so loops can e.g. organize per-step
+            # trajectory dumps. Setdefault so dataset-provided values win.
+            _extra = dict(kwargs.get("extra_info") or {})
+            _extra.setdefault("global_step", trajectory["step"])
+            _extra.setdefault("validate", trajectory["validate"])
+            kwargs["extra_info"] = _extra
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
