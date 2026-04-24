@@ -1,0 +1,36 @@
+# Top-level Hydra config for ALFWorld GRPO training with the agent-loop
+# framework. Mirrors examples/sglang_multiturn/config/gsm8k_multiturn_grpo.yaml
+# but points at our AlfWorldDataset and AlfWorldAgentLoop.
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  # ALFWorld gamefiles are enumerated inside AlfWorldDataset from
+  # config_tw.yaml; these path fields are not consumed but must be
+  # non-null to satisfy upstream Hydra defaults. We pass a sentinel.
+  train_files: /tmp/alfworld_stub_train.parquet
+  val_files: /tmp/alfworld_stub_val.parquet
+  train_batch_size: 16
+  max_prompt_length: 8192
+  max_response_length: 4096
+  filter_overlong_prompts: False
+  truncation: left
+  return_raw_chat: True
+  custom_cls:
+    path: recipe/alfworld/alfworld_dataset.py
+    name: AlfWorldDataset
+
+actor_rollout_ref:
+  hybrid_engine: True
+  rollout:
+    name: vllm
+    mode: async
+    multi_turn:
+      enable: True
+      max_assistant_turns: 50
+      max_user_turns: 50

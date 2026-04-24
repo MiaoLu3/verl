@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}{{ data.request_id[:8] if data.request_id else filename }}{% endblock %}
+{% block crumbs %}
+  / <a href="{{ url_for('home') }}">runs</a>
+  / <a href="{{ url_for('run_view', run_name=run_name) }}">{{ run_name }}</a>
+  / <strong>{{ data.request_id[:12] if data.request_id else filename }}</strong>
+{% endblock %}
+{% block content %}
+
+<h1>Trajectory <code>{{ data.request_id or filename }}</code></h1>
+
+<div class="meta-grid">
+  <div><span class="label">gamefile</span><code>{{ data.gamefile }}</code></div>
+  <div><span class="label">outcome</span>
+    <span class="badge {{ 'ok' if data.won else 'bad' }}">
+      {{ 'WON' if data.won else 'LOST' }}
+    </span>
+  </div>
+  <div><span class="label">final_reward</span>{{ data.final_reward | round2 }}</div>
+  <div><span class="label">num_turns</span>{{ data.num_turns }}</div>
+  <div><span class="label">num_invalid_actions</span>{{ data.num_invalid_actions }}</div>
+  {% if data.prompt_length_final is not none %}
+  <div><span class="label">prompt_length_final</span>{{ data.prompt_length_final }}</div>
+  {% endif %}
+  {% if data.response_length_final is not none %}
+  <div><span class="label">response_length_final</span>{{ data.response_length_final }}</div>
+  {% endif %}
+</div>
+
+<h2>Turns</h2>
+{% for t in data.turns %}
+  <section class="turn {{ 'valid' if t.valid else 'invalid' }}{{ ' done' if t.done else '' }}">
+    <header>
+      <span class="turn-idx">Turn {{ t.turn_idx }}</span>
+      <span class="badge {{ 'ok' if t.valid else 'bad' }}">{{ 'valid' if t.valid else 'invalid' }}</span>
+      <span class="badge info">reward {{ t.reward | round2 }}</span>
+      {% if t.done %}<span class="badge ok">done</span>{% endif %}
+      {% if t._truncated_think %}
+        <span class="badge warn">truncated mid-thinking</span>
+      {% endif %}
+    </header>
+
+    <details class="block" open>
+      <summary><strong>Observation</strong></summary>
+      <pre class="obs">{{ t.observation }}</pre>
+    </details>
+
+    <details class="block">
+      <summary><strong>Admissible actions</strong></summary>
+      <pre class="adm">{{ t.admissible }}</pre>
+    </details>
+
+    <div class="block">
+      <div class="block-title"><strong>Raw response</strong></div>
+      {% if t._truncated_think %}
+        <div class="warning-banner">
+          Response truncated mid-&lt;think&gt; (no closing tag found).
+        </div>
+      {% endif %}
+      <pre class="raw">{{ t._raw_html }}</pre>
+    </div>
+
+    <div class="block parsed-line">
+      <strong>Parsed action:</strong>
+      <span class="parsed {{ 'valid' if t.valid else 'invalid' }}">
+        {{ t.parsed_action }}
+      </span>
+    </div>
+  </section>
+{% endfor %}
+
+<h2>Full decoded sequence</h2>
+{% if show_full %}
+  <p class="muted">{{ full_seq_len }} chars.
+    <a href="{{ url_for('traj_view', run_name=run_name, filename=filename) }}">(hide)</a>
+  </p>
+  <pre class="fullseq">{{ full_seq }}</pre>
+{% else %}
+  <p>
+    <a class="btn" href="{{ url_for('traj_view', run_name=run_name, filename=filename, full=1) }}">
+      Show full_decoded_sequence
+    </a>
+    <span class="muted">(not loaded by default — can be very long)</span>
+  </p>
+{% endif %}
+
+{% endblock %}

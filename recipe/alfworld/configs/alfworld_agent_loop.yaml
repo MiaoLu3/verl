@@ -1,0 +1,22 @@
+# Agent-loop registry for ALFWorld.
+#
+# This file is loaded by ``AgentLoopWorker.__init__`` when
+# ``actor_rollout_ref.rollout.agent.agent_loop_config_path`` points here.
+# The loader iterates the top-level list and, for each entry, stores it in
+# the ``_agent_loop_registry`` dict keyed by ``name``. Our actual class is
+# also self-registered via ``@register("alfworld")`` in
+# ``alfworld_agent_loop.py``; importing that module at worker-init time is
+# what wires the decorator into the registry. The ``_target_`` here is kept
+# for future hydra-style instantiate paths (see ``resolve_config_path``).
+- name: alfworld
+  _target_: recipe.alfworld.alfworld_agent_loop.AlfWorldAgentLoop
+  # AlfWorld-specific kwargs passed to AlfWorldAgentLoop.__init__ via
+  # hydra.utils.instantiate (see AgentLoopWorker._generate, line 631-639).
+  # RolloutConfig is a strict dataclass and rejects these under
+  # `actor_rollout_ref.rollout.alfworld.*` — this YAML is the right home.
+  alf_config_path: /scratch/m000069-pm05/miaolu/verl/recipe/alfworld/config_tw.yaml
+  pool_size: 8
+  seed_base: 42
+  history_length: 0   # 0 → NO_HIS template per turn; pure linear accumulation of raw obs/actions via prompt_ids
+  is_train: true
+  max_steps: 50

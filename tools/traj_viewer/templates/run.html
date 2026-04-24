@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}{{ run_name }}{% endblock %}
+{% block crumbs %}
+  / <a href="{{ url_for('home') }}">runs</a> / <strong>{{ run_name }}</strong>
+{% endblock %}
+{% block content %}
+<h1>{{ run_name }}</h1>
+
+{% if agg %}
+<div class="stats">
+  <span><strong>{{ agg.count }}</strong> trajectories</span>
+  <span>win rate: <strong>{{ agg.win_rate | pct }}</strong> ({{ agg.won }} won)</span>
+  <span>mean turns: <strong>{{ agg.mean_turns | round2 }}</strong></span>
+  <span>mean invalid: <strong>{{ agg.mean_invalid | round2 }}</strong></span>
+  <span class="muted">indexed in {{ '%.1f' % agg.build_secs }}s</span>
+</div>
+{% endif %}
+
+<form method="get" class="filters">
+  <label>Outcome:
+    <select name="won" onchange="this.form.submit()">
+      <option value="all" {% if won_filter == 'all' %}selected{% endif %}>All</option>
+      <option value="won" {% if won_filter == 'won' %}selected{% endif %}>Won</option>
+      <option value="lost" {% if won_filter == 'lost' %}selected{% endif %}>Lost</option>
+    </select>
+  </label>
+  <input type="hidden" name="sort" value="{{ sort_key }}">
+  <input type="hidden" name="dir" value="{{ sort_dir }}">
+</form>
+
+<p class="muted">Showing {{ entries|length }} of {{ total }} (page {{ page }} / {{ total_pages }})</p>
+
+{% macro sort_link(key, label) -%}
+  {% set nd = 'desc' if (sort_key == key and sort_dir == 'asc') else 'asc' %}
+  <a href="{{ url_for('run_view', run_name=run_name, won=won_filter, sort=key, dir=nd, page=1) }}">
+    {{ label }}{% if sort_key == key %} {{ '▲' if sort_dir == 'asc' else '▼' }}{% endif %}
+  </a>
+{%- endmacro %}
+
+<table class="grid">
+  <thead>
+    <tr>
+      <th>{{ sort_link('request_id', 'request_id') }}</th>
+      <th>{{ sort_link('gamefile', 'gamefile') }}</th>
+      <th class="num">{{ sort_link('won', 'won') }}</th>
+      <th class="num">{{ sort_link('final_reward', 'final_reward') }}</th>
+      <th class="num">{{ sort_link('num_turns', 'num_turns') }}</th>
+      <th class="num">{{ sort_link('num_invalid_actions', 'invalid') }}</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in entries %}
+    <tr class="{{ 'won' if e.won else 'lost' }}">
+      <td>
+        <a href="{{ url_for('traj_view', run_name=run_name, filename=e.filename) }}">
+          {{ e.request_id[:12] if e.request_id else e.filename }}
+        </a>
+      </td>
+      <td title="{{ e.gamefile }}">{{ e._gamefile_base }}</td>
+      <td class="num">{{ 'W' if e.won else 'L' }}</td>
+      <td class="num">{{ e.final_reward | round2 }}</td>
+      <td class="num">{{ e.num_turns }}</td>
+      <td class="num">{{ e.num_invalid_actions }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="pager">
+  {% if page > 1 %}
+    <a href="{{ url_for('run_view', run_name=run_name, won=won_filter, sort=sort_key, dir=sort_dir, page=page-1) }}">« prev</a>
+  {% endif %}
+  <span class="muted">page {{ page }} / {{ total_pages }}</span>
+  {% if page < total_pages %}
+    <a href="{{ url_for('run_view', run_name=run_name, won=won_filter, sort=sort_key, dir=sort_dir, page=page+1) }}">next »</a>
+  {% endif %}
+</div>
+{% endblock %}

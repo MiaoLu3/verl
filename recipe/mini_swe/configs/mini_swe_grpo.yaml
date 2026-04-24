@@ -1,0 +1,49 @@
+# Top-level Hydra config for mini-swe-agent x SWE-bench GRPO training with
+# the agent-loop framework. Structurally mirrors
+# ``recipe/alfworld/configs/alfworld_grpo.yaml`` but points at
+# ``SweBenchDataset`` and ``MiniSweAgentLoop``.
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  # SWE-bench rows are enumerated inside ``SweBenchDataset`` from the
+  # registered adapter + the ``$SIF_CACHE_DIR`` of pre-pulled SIFs; the
+  # parquet paths below are non-null sentinels required by the
+  # upstream Hydra defaults (see ``ppo_trainer.yaml``).
+  train_files: /tmp/swebench_stub_train.parquet
+  val_files: /tmp/swebench_stub_val.parquet
+  train_batch_size: 2
+  # SWE-bench instance prompts + long bash transcripts routinely exceed
+  # the alfworld 8K budget -- bump to 16K. MiniSweAgentLoop also
+  # left-truncates inside run() to avoid severing the final context.
+  max_prompt_length: 16384
+  max_response_length: 16384
+  filter_overlong_prompts: False
+  truncation: left
+  return_raw_chat: True
+  custom_cls:
+    path: recipe/mini_swe/dataset.py
+    name: SweBenchDataset
+
+actor_rollout_ref:
+  hybrid_engine: True
+  rollout:
+    name: vllm
+    mode: async
+    # Expanded model-length window; individual rollout turns are capped
+    # by ``response_length`` at ``apply_chat_template`` time.
+    max_model_len: 32768
+    # GRPO group size per instance; keep small for smoke.
+    n: 2
+    multi_turn:
+      enable: True
+      max_assistant_turns: 75
+      max_user_turns: 75
+    agent:
+      default_agent_loop: mini_swe
+      agent_loop_config_path: recipe/mini_swe/configs/agent_loops.yaml

@@ -1,0 +1,19 @@
+# Agent-loop registry for mini-swe-agent x SWE-bench.
+#
+# Loaded by ``AgentLoopWorker.__init__`` when
+# ``actor_rollout_ref.rollout.agent.agent_loop_config_path`` points here.
+# Each entry is hydra-instantiated as a :class:`AgentLoopBase` subclass; the
+# ``_target_`` class is also responsible for its own @register if it uses
+# one. ``MiniSweAgentLoop`` does NOT self-register -- it's registered solely
+# via this YAML so kwargs below flow cleanly into __init__.
+- name: mini_swe
+  _target_: recipe.mini_swe.agent_loop.MiniSweAgentLoop
+  # Path to the vendored swebench_v2.yaml (system_template +
+  # instance_template). Resolvable via MSWE_SWEBENCH_CONFIG, else default
+  # to the file next to agent_loop.py.
+  prompt_config_path: ${oc.env:MSWE_SWEBENCH_CONFIG,${oc.env:PWD}/recipe/mini_swe/configs/swebench_v2.yaml}
+  # Hard cap on generate calls per rollout. Overridable via $MSWE_MAX_TURNS.
+  max_assistant_turns: ${oc.decode:${oc.env:MSWE_MAX_TURNS,75}}
+  # Optional JSONL trajectory dump directory. Left unset for smoke runs;
+  # set $MSWE_TRAJ_DUMP_DIR to opt in from the launch script.
+  trajectory_log_dir: ${oc.env:MSWE_TRAJ_DUMP_DIR,null}

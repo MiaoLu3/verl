@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Runs{% endblock %}
+{% block content %}
+<h1>Runs</h1>
+<p class="muted">Scanning: <code>{{ traj_root }}</code></p>
+<p class="muted">
+  Aggregate stats (win rate, mean turns) are computed when a run is first
+  opened. Click a run to index and view it.
+</p>
+<table class="grid">
+  <thead>
+    <tr>
+      <th>Run</th>
+      <th class="num">Files</th>
+      <th class="num">Indexed</th>
+      <th class="num">Win rate</th>
+      <th class="num">Mean turns</th>
+      <th class="num">Mean invalid</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td><a href="{{ url_for('run_view', run_name=r.name) }}">{{ r.name }}</a></td>
+      <td class="num">{{ r.file_count }}</td>
+      <td class="num">{{ r.agg.count if r.agg else '-' }}</td>
+      <td class="num">{{ (r.agg.win_rate if r.agg else None) | pct }}</td>
+      <td class="num">{{ (r.agg.mean_turns if r.agg else None) | round2 }}</td>
+      <td class="num">{{ (r.agg.mean_invalid if r.agg else None) | round2 }}</td>
+      <td>
+        <a class="btn small" href="{{ url_for('run_view', run_name=r.name) }}">Open</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

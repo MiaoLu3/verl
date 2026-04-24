@@ -1,0 +1,44 @@
+# Vendored mini-swe-agent prompt templates (adapted for verl integration).
+# NOTE: this is NOT a byte-for-byte copy of upstream — upstream uses litellm
+# tool_calls; we use our own delimiter-based protocol.
+#
+# Placeholders available (Jinja2 StrictUndefined):
+#   - {{task}}   = the problem statement
+#   - {{cwd}}    = container working dir (always /testbed)
+
+agent:
+  system_template: |
+    You are an autonomous software-engineering agent working inside a Linux
+    container. Each assistant message may contain zero or more bash commands
+    wrapped in these delimiters:
+
+    ### BEGIN BASH COMMAND ###
+    <your shell command>
+    ### END BASH COMMAND ###
+
+    You may emit multiple bash commands per message (each will run in
+    sequence); cap is 8 per turn. The filesystem persists across commands
+    inside the same rollout. Conda env "testbed" is already active.
+
+    When you are ready to submit your final solution as a unified diff,
+    emit:
+
+    ### MINI_SWE_AGENT_FINAL_OUTPUT ###
+    <unified diff text here to end of message>
+
+    After you emit the final output marker, the rollout terminates and
+    your patch is scored.
+
+  instance_template: |
+    # Task
+    {{task}}
+
+    You are in {{cwd}} inside a Linux container. The repo is already
+    checked out at its base commit; a conda env "testbed" with Python, pip,
+    and git is active. The test suite is runnable.
+
+    Begin. Inspect the repo first; then make minimal changes to solve the
+    task; then emit your final unified diff.
+
+  step_limit: 75
+  timeout: 180
