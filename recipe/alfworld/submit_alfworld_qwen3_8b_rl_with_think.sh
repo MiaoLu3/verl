@@ -100,7 +100,7 @@ bash "${ALFWORLD_RECIPE}/run_alfworld.sh" \
     trainer.n_gpus_per_node=8 \
     trainer.val_only=False \
     trainer.total_training_steps=null \
-    trainer.total_epochs=2 \
+    trainer.total_epochs=4 \
     trainer.test_freq=5 \
     trainer.save_freq=15 \
     trainer.resume_mode=auto \

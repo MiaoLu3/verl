@@ -4,8 +4,9 @@ spike we hit on Qwen3-32B under the full PPO wiring.
 
 Architecture
 ------------
-    StandaloneServerManager (wraps a single vllm.LLM engine, exposes the
-    `generate()` async interface that AgentLoopBase expects)
+    StandaloneServerManager (wraps a single vllm AsyncLLM engine, exposes the
+    `generate()` async interface that AgentLoopBase expects; concurrent
+    callers are batched by vLLM's continuous batcher)
         |
         v
     AlfWorldAgentLoop (unmodified; from recipe.alfworld.alfworld_agent_loop)
@@ -15,14 +16,14 @@ Architecture
     inside AlfWorldAgentLoop)
 
 We instantiate AlfWorldAgentLoop directly, skipping hydra/AgentLoopWorker, and
-drive one episode per valid_seen gamefile. All state-machine / projection /
-trajectory-dumper logic is inherited verbatim.
+drive ``--concurrency`` episodes in parallel via an asyncio.Queue worker pool.
+All state-machine / projection / trajectory-dumper logic is inherited verbatim.
 
 Usage:
     python -m recipe.alfworld.eval_standalone \
         --model_path Qwen/Qwen3-32B \
         --tp 4 \
-        --pool_size 8 \
+        --pool_size 8 --concurrency 8 \
         --alf_config_path /scratch/m000069-pm05/miaolu/verl/recipe/alfworld/config_tw.yaml \
         --dump_dir /scratch/m000069-pm05/miaolu/verl/trajectories/qwen3_32b_eval_YYYYMMDD
 """
@@ -32,6 +33,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -60,7 +62,7 @@ def _task_type_from_gamefile(gamefile: str | None) -> str | None:
 
 
 # ----------------------------------------------------------------------
-# StandaloneServerManager: wraps a local vllm.LLM to match the subset of
+# StandaloneServerManager: wraps a local vllm AsyncLLM to match the subset of
 # AsyncLLMServerManager.generate() that AlfWorldAgentLoop calls.
 # ----------------------------------------------------------------------
 class StandaloneServerManager:
@@ -68,12 +70,10 @@ class StandaloneServerManager:
 
     AlfWorldAgentLoop calls ``await self.server_manager.generate(
     request_id=..., prompt_ids=..., sampling_params=...)`` and expects a
-    ``TokenOutput`` back. We do exactly that with a single in-process vllm.LLM.
-
-    vllm.LLM.generate() is blocking; we punt it to a thread so the asyncio
-    loop can keep running (pool acquire/release + tokenize also happen on
-    executor threads). With pool_size=1 episodes are serialized through the
-    single vllm engine anyway, which is what we want for peak memory safety.
+    ``TokenOutput`` back. We back this with a single in-process vllm
+    ``AsyncLLM`` engine, which supports many concurrent ``generate(...)`` calls
+    that vLLM's continuous batcher fuses into a single batch. No locking
+    needed: each call submits an independent request keyed by ``request_id``.
     """
 
     def __init__(
@@ -85,16 +85,17 @@ class StandaloneServerManager:
         enforce_eager: bool = True,
         dtype: str = "bfloat16",
     ):
-        from vllm import LLM
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.v1.engine.async_llm import AsyncLLM
 
         print(
-            f"[StandaloneServerManager] Loading vllm.LLM model={model_path} "
+            f"[StandaloneServerManager] Loading vllm AsyncLLM model={model_path} "
             f"tp={tensor_parallel_size} max_model_len={max_model_len} "
             f"gpu_util={gpu_memory_utilization} enforce_eager={enforce_eager} dtype={dtype}",
             flush=True,
         )
         t0 = time.time()
-        self.llm = LLM(
+        engine_args = AsyncEngineArgs(
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len,
@@ -102,12 +103,25 @@ class StandaloneServerManager:
             enforce_eager=enforce_eager,
             dtype=dtype,
             trust_remote_code=True,
+            disable_log_stats=True,
+            enable_log_requests=False,
         )
+        self.engine = AsyncLLM.from_engine_args(engine_args)
         print(
-            f"[StandaloneServerManager] vllm.LLM loaded in {time.time() - t0:.1f}s",
+            f"[StandaloneServerManager] vllm AsyncLLM loaded in {time.time() - t0:.1f}s",
             flush=True,
         )
-        self._generate_lock = asyncio.Lock()
+        # Per-call-suffix counter so concurrent calls sharing the same
+        # AlfWorldAgentLoop request_id (sticky session) still submit unique
+        # vllm engine request ids.
+        self._req_seq = 0
+        self._req_seq_lock = asyncio.Lock()
+
+    async def _next_engine_request_id(self, base: str) -> str:
+        async with self._req_seq_lock:
+            self._req_seq += 1
+            n = self._req_seq
+        return f"{base}-{n}"
 
     async def generate(
         self,
@@ -120,6 +134,7 @@ class StandaloneServerManager:
         **_kwargs,
     ):
         from vllm import SamplingParams as VLSP
+        from vllm import TokensPrompt
 
         from verl.workers.rollout.replica import TokenOutput
 
@@ -135,32 +150,26 @@ class StandaloneServerManager:
             sp_kwargs["logprobs"] = 0  # 0 = only the selected token's logprob
         vllm_sp = VLSP(**sp_kwargs)
 
-        loop = asyncio.get_event_loop()
+        prompt = TokensPrompt(prompt_token_ids=list(prompt_ids))
 
-        def _run():
-            # vllm >=0.9 removed the top-level ``prompt_token_ids`` kwarg;
-            # pass token ids via ``TokensPrompt`` in the ``prompts`` list.
-            from vllm import TokensPrompt
-            return self.llm.generate(
-                prompts=[TokensPrompt(prompt_token_ids=list(prompt_ids))],
-                sampling_params=vllm_sp,
-                use_tqdm=False,
-            )
+        # Multiple concurrent assistant turns may share the same agent-loop
+        # request_id; vllm requires unique engine request ids per inflight
+        # request, so suffix with a monotonic counter.
+        engine_request_id = await self._next_engine_request_id(str(request_id))
 
-        # Serialize vllm.generate calls — vllm.LLM's synchronous batched API is
-        # not reentrant; concurrent launches from multiple asyncio tasks would
-        # race over engine state. Our pool_size is the only real concurrency
-        # knob and we target pool_size=1 for 32B; serialize explicitly anyway.
-        async with self._generate_lock:
-            outputs = await loop.run_in_executor(None, _run)
-
-        out = outputs[0]
-        gen = out.outputs[0]
+        final_output = None
+        async for out in self.engine.generate(
+            prompt=prompt,
+            sampling_params=vllm_sp,
+            request_id=engine_request_id,
+        ):
+            final_output = out
+        if final_output is None:
+            raise RuntimeError(f"vllm AsyncLLM yielded no outputs for request {engine_request_id}")
+        gen = final_output.outputs[0]
 
         log_probs_list = None
         if logprobs_flag and getattr(gen, "logprobs", None):
-            # vllm logprobs list[dict[token_id -> Logprob]]. We requested
-            # logprobs=0 so each dict has a single entry; extract its .logprob.
             try:
                 log_probs_list = [next(iter(d.values())).logprob for d in gen.logprobs]
             except Exception:
@@ -275,6 +284,26 @@ async def _run_eval(args):
         os.makedirs(args.dump_dir, exist_ok=True)
         print(f"[eval] ALFWORLD_TRAJ_DUMP_DIR={args.dump_dir}", flush=True)
 
+    # Teacher rollout mode: set TEACHER_ROLLOUT_RUN_DIR + per-trajectory
+    # metadata env vars BEFORE we import AlfWorldAgentLoop (so its dumper
+    # picks them up at __init__). Also auto-extract ckpt_step from the
+    # model_path when not explicitly provided.
+    if args.teacher_rollout_dir:
+        os.makedirs(args.teacher_rollout_dir, exist_ok=True)
+        os.environ["TEACHER_ROLLOUT_RUN_DIR"] = args.teacher_rollout_dir
+        os.environ["TEACHER_ROLLOUT_MODEL_PATH"] = args.model_path
+        if args.ckpt_step >= 0:
+            ckpt_step = args.ckpt_step
+        else:
+            m = re.search(r"global_step_(\d+)", args.model_path)
+            ckpt_step = int(m.group(1)) if m else -1
+        os.environ["TEACHER_ROLLOUT_CKPT_STEP"] = str(ckpt_step)
+        print(
+            f"[eval] TEACHER_ROLLOUT_RUN_DIR={args.teacher_rollout_dir} "
+            f"ckpt_step={ckpt_step}",
+            flush=True,
+        )
+
     # Import AFTER env var is set so the loop reads it on __init__.
     from recipe.alfworld.alfworld_agent_loop import AlfWorldAgentLoop
     from recipe.alfworld.alfworld_dataset import AlfWorldDataset
@@ -307,10 +336,16 @@ async def _run_eval(args):
         flush=True,
     )
     if args.max_samples > 0:
-        num = min(args.max_samples, len(ds))
+        num_unique = min(args.max_samples, len(ds))
     else:
-        num = len(ds)
-    print(f"[eval] evaluating {num} episodes", flush=True)
+        num_unique = len(ds)
+    rollouts_per_game = max(1, int(args.rollouts_per_game))
+    num_episodes = num_unique * rollouts_per_game
+    print(
+        f"[eval] num_unique_games={num_unique} rollouts_per_game={rollouts_per_game} "
+        f"total_episodes={num_episodes}",
+        flush=True,
+    )
 
     # Sampling params for eval — matches T8.5 val_kwargs flow.
     sampling_params = dict(
@@ -323,61 +358,173 @@ async def _run_eval(args):
     )
     print(f"[eval] sampling_params={sampling_params}", flush=True)
 
-    # Run each episode sequentially. With pool_size=1 and a single vllm engine
-    # this is the natural pipeline; bumping pool_size makes env warmup parallel
-    # but vllm is still serialized by StandaloneServerManager._generate_lock.
-    results = []
-    t_start = time.time()
-    for i in range(num):
-        row = ds[i]
-        row_kwargs = {
-            "raw_prompt": row["raw_prompt"],
-            "extra_info": row["extra_info"],
-            "index": row["index"],
-            "tools_kwargs": row["tools_kwargs"],
-            "interaction_kwargs": row["interaction_kwargs"],
-            "agent_name": row["agent_name"],
+    # In teacher rollout mode, write run-level metadata.json once at the
+    # very start so even partial runs are diagnosable.
+    if args.teacher_rollout_dir:
+        meta_path = os.path.join(args.teacher_rollout_dir, "metadata.json")
+        meta_payload = {
+            "run_dir": args.teacher_rollout_dir,
+            "model_path": args.model_path,
+            "ckpt_step": int(os.environ.get("TEACHER_ROLLOUT_CKPT_STEP", "-1")),
+            "split": args.split,
+            "num_unique_games": int(num_unique),
+            "rollouts_per_game": int(rollouts_per_game),
+            "total_episodes_planned": int(num_episodes),
+            "sampling_params": sampling_params,
+            "tp": int(args.tp),
+            "concurrency": int(getattr(args, "concurrency", None) or args.pool_size),
+            "pool_size": int(args.pool_size),
+            "seed_base": int(args.seed_base),
+            "max_steps": int(args.max_steps),
+            "max_assistant_turns": int(args.max_assistant_turns),
+            "max_user_turns": int(args.max_user_turns),
+            "max_tokens_per_turn": int(args.max_tokens_per_turn),
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "args": {k: v for k, v in vars(args).items()},
         }
-        ep_t0 = time.time()
         try:
-            output = await loop.run(sampling_params, **row_kwargs)
-            won = bool(output.extra_fields.get("won", False))
-            num_turns = int(output.num_turns)
-            num_invalid = int(output.extra_fields.get("num_invalid_actions", 0))
-            env_steps = int(output.extra_fields.get("env_steps", 0))
-            gamefile = output.extra_fields.get("gamefile") or row["extra_info"]["gamefile"]
-        except Exception as e:
-            print(
-                f"[eval] FAIL episode {i+1}/{num} gamefile={row['extra_info']['gamefile']}: "
-                f"{type(e).__name__}: {e}",
-                flush=True,
-            )
-            won = False
-            num_turns = 0
-            num_invalid = 0
-            env_steps = 0
-            gamefile = row["extra_info"]["gamefile"]
+            with open(meta_path, "w") as f:
+                json.dump(meta_payload, f, indent=2, default=str)
+            print(f"[eval] wrote metadata: {meta_path}", flush=True)
+        except Exception as e:  # pragma: no cover
+            print(f"[eval] metadata write FAILED: {e}", flush=True)
 
-        results.append(
-            {
-                "gamefile": gamefile,
-                "task_type": _task_type_from_gamefile(gamefile),
-                "won": won,
-                "num_turns": num_turns,
-                "num_invalid_actions": num_invalid,
-                "env_steps": env_steps,
-            }
-        )
-        elapsed = time.time() - ep_t0
-        total_elapsed = time.time() - t_start
-        cur_wins = sum(1 for r in results if r["won"])
+    # Run episodes concurrently against the shared AsyncLLM engine. Each
+    # worker pulls episode indices from a shared queue, runs one full
+    # AlfWorldAgentLoop episode (acquiring an env actor from the ray pool
+    # internally), and appends the result. vLLM's continuous batching fuses
+    # the per-turn requests across workers; the env-actor pool serializes
+    # access to the underlying alfworld games. For teacher rollout we push
+    # rollouts_per_game copies of each index — the agent_loop dumper picks
+    # the rollout_idx from filesystem state so we don't need to track it
+    # here.
+    results: list[dict] = []
+    results_lock = asyncio.Lock()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    # Skip-resume support (teacher rollout only): scan existing
+    # by_task_type/<task>/<gid>__rollout_<n>.jsonl files, count per gamefile_id,
+    # and only enqueue the games that still need more rollouts. For non-teacher
+    # mode (RL training, val) we don't dedup -- those legacy paths are still
+    # request_id-keyed and re-running is the expected behavior.
+    if args.teacher_rollout_dir:
+        from recipe.alfworld.alfworld_agent_loop import _extract_gamefile_id
+
+        existing_per_gid: dict[str, int] = {}
+        bt_root = os.path.join(args.teacher_rollout_dir, "by_task_type")
+        if os.path.isdir(bt_root):
+            for task_dir in os.listdir(bt_root):
+                tdir = os.path.join(bt_root, task_dir)
+                if not os.path.isdir(tdir):
+                    continue
+                for fname in os.listdir(tdir):
+                    if not fname.endswith(".jsonl"):
+                        continue
+                    # e.g. "T20190907_174746_989712__rollout_3.jsonl"
+                    if "__rollout_" not in fname:
+                        continue
+                    gid = fname.split("__rollout_", 1)[0]
+                    existing_per_gid[gid] = existing_per_gid.get(gid, 0) + 1
+
+        n_already_done = sum(min(c, rollouts_per_game) for c in existing_per_gid.values())
+        n_remaining = 0
+        for i in range(num_unique):
+            gid = _extract_gamefile_id(
+                ds[i]["extra_info"].get("gamefile", "") if "gamefile" in ds[i]["extra_info"] else ""
+            )
+            need = max(0, rollouts_per_game - existing_per_gid.get(gid, 0))
+            for _ in range(need):
+                queue.put_nowait(i)
+                n_remaining += 1
         print(
-            f"[eval] [{i+1}/{num}] won={won} turns={num_turns} "
-            f"invalid={num_invalid} ep_time={elapsed:.1f}s "
-            f"running_sr={cur_wins}/{len(results)}={cur_wins/len(results):.3f} "
-            f"total={total_elapsed:.1f}s",
+            f"[eval] resume scan: existing_per_gid={len(existing_per_gid)} games, "
+            f"already_done≈{n_already_done}, queueing {n_remaining} remaining episodes "
+            f"(was planning {num_episodes})",
             flush=True,
         )
+        num_episodes = n_remaining
+    else:
+        for _ in range(rollouts_per_game):
+            for i in range(num_unique):
+                queue.put_nowait(i)
+
+    concurrency = max(1, int(getattr(args, "concurrency", None) or args.pool_size))
+    for _ in range(concurrency):
+        queue.put_nowait(None)  # sentinel per worker
+    print(
+        f"[eval] launching {concurrency} concurrent workers over {num_episodes} episodes",
+        flush=True,
+    )
+
+    if num_episodes == 0:
+        print("[eval] nothing to do — all rollouts already exist. Exiting.", flush=True)
+        return {"num_episodes": 0, "wins": 0, "success_rate": 0.0, "results": []}
+
+    t_start = time.time()
+
+    async def _worker(worker_id: int):
+        while True:
+            i = await queue.get()
+            if i is None:
+                queue.task_done()
+                return
+            row = ds[i]
+            row_kwargs = {
+                "raw_prompt": row["raw_prompt"],
+                "extra_info": row["extra_info"],
+                "index": row["index"],
+                "tools_kwargs": row["tools_kwargs"],
+                "interaction_kwargs": row["interaction_kwargs"],
+                "agent_name": row["agent_name"],
+            }
+            ep_t0 = time.time()
+            try:
+                output = await loop.run(sampling_params, **row_kwargs)
+                won = bool(output.extra_fields.get("won", False))
+                num_turns = int(output.num_turns)
+                num_invalid = int(output.extra_fields.get("num_invalid_actions", 0))
+                env_steps = int(output.extra_fields.get("env_steps", 0))
+                gamefile = output.extra_fields.get("gamefile") or row["extra_info"]["gamefile"]
+            except Exception as e:
+                print(
+                    f"[eval] FAIL episode idx={i} worker={worker_id} "
+                    f"gamefile={row['extra_info']['gamefile']}: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+                won = False
+                num_turns = 0
+                num_invalid = 0
+                env_steps = 0
+                gamefile = row["extra_info"]["gamefile"]
+
+            elapsed = time.time() - ep_t0
+            async with results_lock:
+                results.append(
+                    {
+                        "gamefile": gamefile,
+                        "task_type": _task_type_from_gamefile(gamefile),
+                        "won": won,
+                        "num_turns": num_turns,
+                        "num_invalid_actions": num_invalid,
+                        "env_steps": env_steps,
+                    }
+                )
+                done_so_far = len(results)
+                cur_wins = sum(1 for r in results if r["won"])
+            total_elapsed = time.time() - t_start
+            print(
+                f"[eval] [{done_so_far}/{num_episodes}] (idx={i} worker={worker_id}) "
+                f"won={won} turns={num_turns} invalid={num_invalid} "
+                f"ep_time={elapsed:.1f}s "
+                f"running_sr={cur_wins}/{done_so_far}={cur_wins/done_so_far:.3f} "
+                f"total={total_elapsed:.1f}s",
+                flush=True,
+            )
+            queue.task_done()
+
+    workers = [asyncio.create_task(_worker(w)) for w in range(concurrency)]
+    await asyncio.gather(*workers)
 
     # ----------------------------------------------------------------
     # Aggregate
@@ -438,14 +585,20 @@ async def _run_eval(args):
         "results": results,
     }
     if args.summary_path:
-        with open(args.summary_path, "w") as f:
-            json.dump(summary, f, indent=2, default=str)
-        print(f"[eval] summary written to {args.summary_path}", flush=True)
+        summary_target = args.summary_path
+    elif args.teacher_rollout_dir:
+        summary_target = os.path.join(args.teacher_rollout_dir, "summary.json")
     elif args.dump_dir:
-        p = os.path.join(args.dump_dir, "summary.json")
-        with open(p, "w") as f:
-            json.dump(summary, f, indent=2, default=str)
-        print(f"[eval] summary written to {p}", flush=True)
+        summary_target = os.path.join(args.dump_dir, "summary.json")
+    else:
+        summary_target = ""
+    if summary_target:
+        try:
+            with open(summary_target, "w") as f:
+                json.dump(summary, f, indent=2, default=str)
+            print(f"[eval] summary written to {summary_target}", flush=True)
+        except Exception as e:  # pragma: no cover
+            print(f"[eval] summary write FAILED: {e}", flush=True)
 
     return summary
 
@@ -465,6 +618,13 @@ def parse_args():
         default="/scratch/m000069-pm05/miaolu/verl/recipe/alfworld/config_tw.yaml",
     )
     p.add_argument("--pool_size", type=int, default=8)
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        help="Number of concurrent agent_loop episodes against the shared "
+             "vllm AsyncLLM engine. 0 = match --pool_size.",
+    )
     p.add_argument("--seed_base", type=int, default=1042)
     p.add_argument("--history_length", type=int, default=0)
     p.add_argument("--max_steps", type=int, default=50)
@@ -486,6 +646,39 @@ def parse_args():
     p.add_argument("--dump_dir", type=str, default="")
     p.add_argument("--summary_path", type=str, default="")
     p.add_argument("--num_cpus", type=int, default=8)
+
+    # Teacher-rollout mode: when --teacher_rollout_dir is set, the
+    # AlfWorldAgentLoop dumper switches to the by_task_type/<task>/<gamefile_id>__rollout_<idx>.jsonl
+    # layout (instead of step_<N>/<request_id>.jsonl) and includes
+    # tokens.{input_ids,attention_mask,position_ids,loss_mask} +
+    # gamefile_id/task_type/rollout_idx/sampling_params/model_path/ckpt_step.
+    # The trajectories are then trivially convertible to a verl-SFT parquet
+    # via tools/jsonl_to_parquet.py.
+    p.add_argument(
+        "--teacher_rollout_dir",
+        type=str,
+        default="",
+        help="If set, treat this as a teacher rollout: dump trajectories under "
+             "<teacher_rollout_dir>/by_task_type/<task_type>/<id>__rollout_<n>.jsonl "
+             "with full tokens fields, and write metadata.json + summary.json at "
+             "the run root.",
+    )
+    p.add_argument(
+        "--ckpt_step",
+        type=int,
+        default=-1,
+        help="Optional explicit checkpoint step number for metadata. If "
+             "--model_path looks like .../global_step_<N>/actor/huggingface, the "
+             "step is auto-extracted when this flag is left at -1.",
+    )
+    p.add_argument(
+        "--rollouts_per_game",
+        type=int,
+        default=1,
+        help="Number of independent passes over the dataset (each with a fresh "
+             "seed_base offset). Each pass writes a new rollout_idx per game. "
+             "Used for teacher rollout multi-sampling.",
+    )
     return p.parse_args()
 
 

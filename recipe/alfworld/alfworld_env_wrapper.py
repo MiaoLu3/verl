@@ -170,8 +170,28 @@ class AlfWorldSingleEnv:
     # Core gym-like API
     # ------------------------------------------------------------------
 
-    def reset(self) -> tuple[str, list[str], dict]:
-        obs_list, infos = self.env.reset()
+    def reset(self, gamefile: str | None = None) -> tuple[str, list[str], dict]:
+        """Reset the env to start a new episode.
+
+        If ``gamefile`` is None (default), the underlying TextWorld batch env's
+        ``shuffled_cycle`` decides which game to play next (deterministic per
+        seed but not pinnable). When ``gamefile`` is given, we bypass the
+        iterator and ``load([gamefile])`` directly, guaranteeing that exact
+        game runs. This is what teacher-rollout mode uses to get exact
+        per-game coverage.
+        """
+        if gamefile is not None:
+            # Bypass shuffled_cycle: pin a specific gamefile by directly
+            # loading it into the batch_env. Mirrors the body of
+            # textworld.gym.envs.textworld_batch.TextWorldBatch.reset() but
+            # skips the `next(self._gamefiles_iterator)` call.
+            if getattr(self.env, "batch_env", None) is not None:
+                self.env.batch_env.close()
+            self.env.batch_env.load([gamefile])
+            self.env.last_commands = [None] * self.env.batch_size
+            obs_list, infos = self.env.batch_env.reset()
+        else:
+            obs_list, infos = self.env.reset()
         info = _unwrap_infos(infos)
         text_obs = obs_list[0]
 

@@ -80,8 +80,8 @@ class AlfWorldActor:
 
     # --- core gym-like API, each returns Ray object refs over the wire -----
 
-    def reset(self) -> tuple[str, list[str], dict]:
-        return self.env.reset()
+    def reset(self, gamefile: str | None = None) -> tuple[str, list[str], dict]:
+        return self.env.reset(gamefile=gamefile)
 
     def step(self, action: str) -> tuple[str, list[str], float, bool, dict]:
         return self.env.step(action)

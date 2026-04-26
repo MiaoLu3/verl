@@ -14,7 +14,7 @@
 #   sbatch recipe/alfworld/submit_alfworld_qwen3_4b_val.sh
 # =============================================================================
 
-#SBATCH --job-name=alfworld-qwen3-0.6b-rl-wt
+#SBATCH --job-name=alfworld-qwen2.5-0.5b-rl
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH -p batch
@@ -52,7 +52,7 @@ export WANDB_ENTITY=miaolu-stanford-university
 export WANDB_PROJECT=verl_agent_alfworld
 
 # Local JSONL trajectory dumper
-export ALFWORLD_TRAJ_DUMP_DIR="${UPSTREAM_VERL}/trajectories/qwen3_0.6b_rl_wt_$(date +%Y%m%d_%H%M%S)"
+export ALFWORLD_TRAJ_DUMP_DIR="${UPSTREAM_VERL}/trajectories/qwen2.5_0.5b_rl_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${ALFWORLD_TRAJ_DUMP_DIR}"
 echo "Trajectory dump dir: ${ALFWORLD_TRAJ_DUMP_DIR}"
 
@@ -93,14 +93,14 @@ echo "=============================================="
 # instruction. Default True produces a plain "<|im_start|>assistant\n"
 # prefix and lets the model emit its own <think>...</think><action>...
 bash "${ALFWORLD_RECIPE}/run_alfworld.sh" \
-    actor_rollout_ref.model.path=Qwen/Qwen3-0.6B \
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
     trainer.val_only=False \
     trainer.total_training_steps=null \
-    trainer.total_epochs=6 \
+    trainer.total_epochs=4 \
     trainer.test_freq=5 \
     trainer.save_freq=15 \
     trainer.resume_mode=auto \
-    trainer.experiment_name=agent_loop_qwen3_0.6b_rl_with_think
+    trainer.experiment_name=agent_loop_qwen2.5_0.5b_rl
 
 EXIT_CODE=$?
 echo "=============================================="

@@ -91,6 +91,50 @@ def _parse_chat_messages(decoded: str) -> list[dict]:
     return out
 
 
+_GAMEFILE_ID_RE = re.compile(r"trial_(T\d{8}_\d{6}_\d{6})")
+_TASK_TYPE_RE = re.compile(
+    r"json_2\.1\.1/(?:train|valid_seen|valid_unseen)/([A-Za-z_]+?)-"
+)
+
+
+def _extract_gamefile_id(gamefile: str) -> str:
+    """Pull the unique trial timestamp out of an alfworld gamefile path.
+
+    Example: ``.../trial_T20190907_174746_989712/game.tw-pddl`` →
+    ``T20190907_174746_989712``. Returns ``"unknown"`` if no match.
+    """
+    if not gamefile:
+        return "unknown"
+    m = _GAMEFILE_ID_RE.search(gamefile)
+    return m.group(1) if m else "unknown"
+
+
+def _extract_task_type(gamefile: str) -> str:
+    """Pull the task type (e.g. ``pick_and_place_simple``) from an alfworld
+    gamefile path. Returns ``"unknown"`` if no match.
+    """
+    if not gamefile:
+        return "unknown"
+    m = _TASK_TYPE_RE.search(gamefile)
+    return m.group(1) if m else "unknown"
+
+
+def _next_rollout_idx(out_dir: str, gamefile_id: str) -> int:
+    """Best-effort sequential rollout index: count existing
+    ``<gamefile_id>__rollout_*.jsonl`` files in ``out_dir`` and return that
+    count. Race-condition-prone under heavy concurrent dispatch; collisions
+    must be retried at the caller via os.O_EXCL or similar.
+    """
+    if not os.path.isdir(out_dir):
+        return 0
+    prefix = f"{gamefile_id}__rollout_"
+    return sum(
+        1
+        for f in os.listdir(out_dir)
+        if f.startswith(prefix) and f.endswith(".jsonl")
+    )
+
+
 class _AgentState(Enum):
     PENDING = "pending"
     GENERATING = "generating"
@@ -454,7 +498,7 @@ class AlfWorldAgentLoop(AgentLoopBase):
             }
         )
 
-        if self.dump_dir:
+        if self.dump_dir or os.environ.get("TEACHER_ROLLOUT_RUN_DIR"):
             self._dump_trajectory(
                 agent_data=agent_data,
                 prompt_ids_final=prompt_ids_final,
@@ -464,6 +508,7 @@ class AlfWorldAgentLoop(AgentLoopBase):
                 reward_score=reward_score,
                 global_step=global_step,
                 validate=validate,
+                sampling_params=sampling_params,
             )
 
         return output
@@ -482,12 +527,27 @@ class AlfWorldAgentLoop(AgentLoopBase):
         reward_score: float,
         global_step: int = -1,
         validate: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> None:
-        """Write a single JSONL record for this episode to ``self.dump_dir``.
+        """Write a single JSONL record for this episode.
 
-        Opt-in via the ``ALFWORLD_TRAJ_DUMP_DIR`` env var. Records go into
-        ``{dump_dir}/step_{global_step}{_val if validate}/<request_id>.jsonl``
-        (with ``step_unknown`` fallback when the trainer didn't pass a step).
+        Two layouts:
+
+        - **Legacy (RL training, val-only):** triggered by ``ALFWORLD_TRAJ_DUMP_DIR``.
+          File path = ``{dump_dir}/step_{global_step}[_val]/<request_id>.jsonl``.
+          ``step_unknown[_val]`` fallback when no step is passed.
+        - **Teacher rollout:** triggered by ``TEACHER_ROLLOUT_RUN_DIR``. File path
+          = ``{run_dir}/by_task_type/{task_type}/<gamefile_id>__rollout_<idx>.jsonl``.
+          ``rollout_idx`` is the count of pre-existing files for this gamefile in
+          the same directory (best-effort; concurrent dispatch can race, in which
+          case the second writer simply overwrites — we accept that for SFT use).
+
+        Both layouts emit the same enriched record (gamefile_id / task_type /
+        rollout_idx / messages / tokens.{input_ids,attention_mask,position_ids,
+        loss_mask} / lengths / sampling_params / model_path / ckpt_step). The
+        ``tokens.loss_mask`` is full-length (= initial-prompt zeros + agent_loop
+        ``response_mask``) so downstream SFT trainers can re-tokenize from
+        ``messages`` and compare against this ground truth.
         """
         mask_1 = sum(1 for m in response_mask_final if m == 1)
         mask_0 = len(response_mask_final) - mask_1
@@ -511,37 +571,109 @@ class AlfWorldAgentLoop(AgentLoopBase):
         # curation trivial -- no re-templating required.
         messages = _parse_chat_messages(full_decoded)
 
+        gamefile = (
+            agent_data.gamefile or agent_data.info.get("extra.gamefile") or ""
+        )
+        gamefile_id = _extract_gamefile_id(gamefile)
+        task_type = _extract_task_type(gamefile)
+
+        # Build full-length loss_mask: initial-prompt portion is non-trainable
+        # (zeros), then the agent_loop response_mask carries forward (1 for
+        # assistant-generated tokens, 0 for spliced env observations).
+        prompt_len = len(prompt_ids_final)
+        loss_mask_full = [0] * prompt_len + list(response_mask_final)
+        # Length-align with input_ids in case response_mask was clipped earlier.
+        if len(loss_mask_full) < len(full_ids):
+            loss_mask_full = loss_mask_full + [0] * (len(full_ids) - len(loss_mask_full))
+        elif len(loss_mask_full) > len(full_ids):
+            loss_mask_full = loss_mask_full[: len(full_ids)]
+        attention_mask = [1] * len(full_ids)
+        position_ids = list(range(len(full_ids)))
+
+        # Teacher-rollout mode overrides path layout AND adds run-level meta.
+        teacher_dir = os.environ.get("TEACHER_ROLLOUT_RUN_DIR")
+        if teacher_dir:
+            out_dir = os.path.join(teacher_dir, "by_task_type", task_type)
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except Exception as e:  # pragma: no cover
+                logger.warning("teacher rollout mkdir failed for %s: %s", out_dir, e)
+                return
+            # Race-safe rollout_idx allocation: try O_EXCL create starting at
+            # the count of existing files, increment on collision. Multiple
+            # concurrent workers pinned to the same gamefile (which happens
+            # when rollouts_per_game > 1) will each grab a unique idx.
+            rollout_idx = _next_rollout_idx(out_dir, gamefile_id)
+            path = None
+            for _try_idx in range(rollout_idx, rollout_idx + 100):
+                cand = os.path.join(out_dir, f"{gamefile_id}__rollout_{_try_idx}.jsonl")
+                try:
+                    fd = os.open(
+                        cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+                    )
+                    os.close(fd)
+                    rollout_idx = _try_idx
+                    path = cand
+                    break
+                except FileExistsError:
+                    continue
+            if path is None:
+                logger.warning(
+                    "alfworld teacher dump: could not claim rollout_idx in 100 tries "
+                    "for %s; skipping write", gamefile_id
+                )
+                return
+        else:
+            # Legacy step_<N>/ subdir layout for RL training / val-only.
+            if global_step >= 0:
+                subdir = f"step_{global_step}_val" if validate else f"step_{global_step}"
+            else:
+                subdir = "step_unknown_val" if validate else "step_unknown"
+            out_dir = os.path.join(self.dump_dir, subdir)
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except Exception as e:  # pragma: no cover
+                logger.warning(
+                    "alfworld trajectory dump mkdir failed for %s: %s", out_dir, e
+                )
+                return
+            rollout_idx = 0
+            fname = f"{agent_data.request_id}.jsonl"
+            path = os.path.join(out_dir, fname)
+
         record = {
             "request_id": agent_data.request_id,
-            "gamefile": agent_data.gamefile or agent_data.info.get("extra.gamefile"),
+            "gamefile": gamefile,
+            "gamefile_id": gamefile_id,
+            "task_type": task_type,
+            "task_goal": agent_data.extra_fields.get("task", ""),
+            "rollout_idx": int(rollout_idx),
             "won": bool(won),
             "final_reward": float(reward_score),
             "global_step": int(global_step),
             "validate": bool(validate),
             "num_turns": len(agent_data.trajectory_turns),
             "num_invalid_actions": int(agent_data.num_invalid_actions),
+            "lengths": {
+                "prompt_length_final": prompt_len,
+                "response_length_final": len(response_ids_final),
+                "loss_mask_1_count": int(mask_1),
+                "loss_mask_0_count": int(mask_0),
+            },
             "turns": agent_data.trajectory_turns,
-            "prompt_length_final": len(prompt_ids_final),
-            "response_length_final": len(response_ids_final),
-            "response_mask_1_count": int(mask_1),
-            "response_mask_0_count": int(mask_0),
-            "full_decoded_sequence": full_decoded,
             "messages": messages,
+            "full_decoded_sequence": full_decoded,
+            "tokens": {
+                "input_ids": list(full_ids),
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "loss_mask": loss_mask_full,
+            },
+            "model_path": os.environ.get("TEACHER_ROLLOUT_MODEL_PATH", ""),
+            "ckpt_step": int(os.environ.get("TEACHER_ROLLOUT_CKPT_STEP", "-1")),
+            "sampling_params": dict(sampling_params or {}),
         }
-        # Per-step subdir layout. step_unknown catches fallback (global_step=-1),
-        # and validation dumps land in step_<N>_val/ to keep them separate.
-        if global_step >= 0:
-            subdir = f"step_{global_step}_val" if validate else f"step_{global_step}"
-        else:
-            subdir = "step_unknown_val" if validate else "step_unknown"
-        out_dir = os.path.join(self.dump_dir, subdir)
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception as e:  # pragma: no cover
-            logger.warning("alfworld trajectory dump mkdir failed for %s: %s", out_dir, e)
-            return
-        fname = f"{agent_data.request_id}.jsonl"
-        path = os.path.join(out_dir, fname)
+
         try:
             with open(path, "w") as f:
                 f.write(json.dumps(record, default=str) + "\n")
@@ -557,8 +689,15 @@ class AlfWorldAgentLoop(AgentLoopBase):
         agent_data: _AlfWorldAgentData,
         sampling_params: dict[str, Any],
     ) -> _AgentState:
-        """Reset the env and build the initial prompt."""
-        obs, adm, info = await agent_data.actor.reset.remote()
+        """Reset the env and build the initial prompt.
+
+        If ``agent_data.gamefile`` is non-empty (set from ``extra_info.gamefile``
+        by ``run()``), the env is pinned to that exact gamefile (bypass the
+        actor's shuffled_cycle). Otherwise the actor's iterator picks the next
+        game.
+        """
+        pin = agent_data.gamefile if agent_data.gamefile else None
+        obs, adm, info = await agent_data.actor.reset.remote(gamefile=pin)
         agent_data.obs = obs
         agent_data.admissible = list(adm)
         agent_data.info = dict(info)
