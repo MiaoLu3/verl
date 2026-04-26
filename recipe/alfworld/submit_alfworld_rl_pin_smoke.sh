@@ -98,18 +98,12 @@ echo "Verifying pinning correctness..."
 echo "=============================================="
 
 python <<EOF
-import json, os, sys
+import json, os, sys, glob
 from collections import defaultdict
 dump_dir = "${DUMP_DIR}"
 
-# Walk dump_dir/step_*/<request_id>.jsonl, count rollouts per gamefile_id.
-files = []
-for sub in sorted(os.listdir(dump_dir)):
-    sub_path = os.path.join(dump_dir, sub)
-    if os.path.isdir(sub_path):
-        for f in sorted(os.listdir(sub_path)):
-            if f.endswith(".jsonl"):
-                files.append(os.path.join(sub_path, f))
+# RL training layout (now unified with teacher): step_<N>/by_task_type/<task>/<gid>__rollout_<idx>.jsonl
+files = sorted(glob.glob(os.path.join(dump_dir, "step_*/by_task_type/*/*.jsonl")))
 print(f"found {len(files)} jsonl files under {dump_dir}")
 if not files:
     sys.exit("FAIL: no trajectory files dumped")

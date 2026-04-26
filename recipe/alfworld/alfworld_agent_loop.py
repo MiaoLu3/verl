@@ -590,53 +590,56 @@ class AlfWorldAgentLoop(AgentLoopBase):
         attention_mask = [1] * len(full_ids)
         position_ids = list(range(len(full_ids)))
 
-        # Teacher-rollout mode overrides path layout AND adds run-level meta.
+        # Resolve target directory. Both modes use the same leaf layout:
+        #   ``<root>/by_task_type/<task_type>/<gid>__rollout_<idx>.jsonl``
+        # so downstream tooling (jsonl_to_parquet, traj_viewer) can treat
+        # them uniformly. They differ only in where ``<root>`` is rooted:
+        #
+        # * Teacher rollout: ``<TEACHER_ROLLOUT_RUN_DIR>``
+        # * RL training / val: ``<ALFWORLD_TRAJ_DUMP_DIR>/step_<N>[_val]``
+        #   (``step_unknown[_val]`` fallback when no step is passed).
         teacher_dir = os.environ.get("TEACHER_ROLLOUT_RUN_DIR")
         if teacher_dir:
-            out_dir = os.path.join(teacher_dir, "by_task_type", task_type)
-            try:
-                os.makedirs(out_dir, exist_ok=True)
-            except Exception as e:  # pragma: no cover
-                logger.warning("teacher rollout mkdir failed for %s: %s", out_dir, e)
-                return
-            # Race-safe rollout_idx allocation: try O_EXCL create starting at
-            # the count of existing files, increment on collision. Multiple
-            # concurrent workers pinned to the same gamefile (which happens
-            # when rollouts_per_game > 1) will each grab a unique idx.
-            rollout_idx = _next_rollout_idx(out_dir, gamefile_id)
-            path = None
-            for _try_idx in range(rollout_idx, rollout_idx + 100):
-                cand = os.path.join(out_dir, f"{gamefile_id}__rollout_{_try_idx}.jsonl")
-                try:
-                    fd = os.open(
-                        cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
-                    )
-                    os.close(fd)
-                    rollout_idx = _try_idx
-                    path = cand
-                    break
-                except FileExistsError:
-                    continue
-            if path is None:
-                logger.warning(
-                    "alfworld teacher dump: could not claim rollout_idx in 100 tries "
-                    "for %s; skipping write", gamefile_id
-                )
-                return
+            root = teacher_dir
         else:
-            # Legacy step_<N>/ subdir layout for RL training / val-only.
             if global_step >= 0:
                 subdir = f"step_{global_step}_val" if validate else f"step_{global_step}"
             else:
                 subdir = "step_unknown_val" if validate else "step_unknown"
-            out_dir = os.path.join(self.dump_dir, subdir)
+            root = os.path.join(self.dump_dir, subdir)
+
+        out_dir = os.path.join(root, "by_task_type", task_type)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:  # pragma: no cover
+            logger.warning("alfworld trajectory mkdir failed for %s: %s", out_dir, e)
+            return
+
+        # Race-safe rollout_idx allocation: try O_EXCL create starting at
+        # the count of existing files, increment on collision. Multiple
+        # concurrent workers pinned to the same gamefile (which happens
+        # whenever rollout_n > 1 in RL training, or rollouts_per_game > 1
+        # in teacher rollout) will each grab a unique idx.
+        rollout_idx = _next_rollout_idx(out_dir, gamefile_id)
+        path = None
+        for _try_idx in range(rollout_idx, rollout_idx + 100):
+            cand = os.path.join(out_dir, f"{gamefile_id}__rollout_{_try_idx}.jsonl")
             try:
-                os.makedirs(out_dir, exist_ok=True)
-            except Exception as e:  # pragma: no cover
-                logger.warning(
-                    "alfworld trajectory dump mkdir failed for %s: %s", out_dir, e
+                fd = os.open(
+                    cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
                 )
-                return
+                os.close(fd)
+                rollout_idx = _try_idx
+                path = cand
+                break
+            except FileExistsError:
+                continue
+        if path is None:
+            logger.warning(
+                "alfworld trajectory dump: could not claim rollout_idx in 100 tries "
+                "for %s; skipping write", gamefile_id
+            )
+            return
             rollout_idx = 0
             fname = f"{agent_data.request_id}.jsonl"
             path = os.path.join(out_dir, fname)
