@@ -830,7 +830,10 @@ class AlfWorldAgentLoop(AgentLoopBase):
         agent_data.turn_scores.append(float(reward))
         agent_data.env_steps += 1
 
-        if self.dump_dir:
+        # Append to trajectory_turns when EITHER legacy dump dir is set OR
+        # teacher rollout mode is on. Earlier this only checked
+        # ``self.dump_dir``, leaving teacher dumps with empty turns[] / num_turns=0.
+        if self.dump_dir or os.environ.get("TEACHER_ROLLOUT_RUN_DIR"):
             agent_data.trajectory_turns.append(
                 {
                     "turn_idx": turn_idx,
