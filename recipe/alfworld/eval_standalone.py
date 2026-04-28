@@ -339,10 +339,41 @@ async def _run_eval(args):
         num_unique = min(args.max_samples, len(ds))
     else:
         num_unique = len(ds)
+
+    # Optional gamefile-id whitelist (used by DAgger Phase 1 to roll the
+    # student only on a specific bucket like S35x64 part B).
+    from recipe.alfworld.alfworld_agent_loop import _extract_gamefile_id as _gid
+    if args.gamefile_filter_json:
+        with open(args.gamefile_filter_json) as _f:
+            _payload = json.load(_f)
+        # Accept either {"gamefile_ids": [...]} or a flat list.
+        whitelist = set(_payload["gamefile_ids"] if isinstance(_payload, dict) else _payload)
+        unique_indices = [
+            i for i in range(num_unique)
+            if _gid(ds[i]["extra_info"].get("gamefile", "")) in whitelist
+        ]
+        present = {_gid(ds[i]["extra_info"].get("gamefile", "")) for i in unique_indices}
+        missing = whitelist - present
+        print(
+            f"[eval] gamefile_filter_json={args.gamefile_filter_json} "
+            f"whitelist={len(whitelist)} matched={len(unique_indices)} "
+            f"missing={len(missing)}",
+            flush=True,
+        )
+        if missing:
+            print(f"[eval]   missing gids (first 5): {sorted(missing)[:5]}", flush=True)
+        if not unique_indices:
+            raise RuntimeError(
+                f"gamefile_filter_json {args.gamefile_filter_json} matched 0 games "
+                f"in split {args.split} -- check the split argument."
+            )
+    else:
+        unique_indices = list(range(num_unique))
+
     rollouts_per_game = max(1, int(args.rollouts_per_game))
-    num_episodes = num_unique * rollouts_per_game
+    num_episodes = len(unique_indices) * rollouts_per_game
     print(
-        f"[eval] num_unique_games={num_unique} rollouts_per_game={rollouts_per_game} "
+        f"[eval] num_unique_games={len(unique_indices)} rollouts_per_game={rollouts_per_game} "
         f"total_episodes={num_episodes}",
         flush=True,
     )
@@ -408,8 +439,6 @@ async def _run_eval(args):
     # mode (RL training, val) we don't dedup -- those legacy paths are still
     # request_id-keyed and re-running is the expected behavior.
     if args.teacher_rollout_dir:
-        from recipe.alfworld.alfworld_agent_loop import _extract_gamefile_id
-
         existing_per_gid: dict[str, int] = {}
         bt_root = os.path.join(args.teacher_rollout_dir, "by_task_type")
         if os.path.isdir(bt_root):
@@ -428,8 +457,8 @@ async def _run_eval(args):
 
         n_already_done = sum(min(c, rollouts_per_game) for c in existing_per_gid.values())
         n_remaining = 0
-        for i in range(num_unique):
-            gid = _extract_gamefile_id(
+        for i in unique_indices:
+            gid = _gid(
                 ds[i]["extra_info"].get("gamefile", "") if "gamefile" in ds[i]["extra_info"] else ""
             )
             need = max(0, rollouts_per_game - existing_per_gid.get(gid, 0))
@@ -445,7 +474,7 @@ async def _run_eval(args):
         num_episodes = n_remaining
     else:
         for _ in range(rollouts_per_game):
-            for i in range(num_unique):
+            for i in unique_indices:
                 queue.put_nowait(i)
 
     concurrency = max(1, int(getattr(args, "concurrency", None) or args.pool_size))
@@ -678,6 +707,16 @@ def parse_args():
         help="Number of independent passes over the dataset (each with a fresh "
              "seed_base offset). Each pass writes a new rollout_idx per game. "
              "Used for teacher rollout multi-sampling.",
+    )
+    p.add_argument(
+        "--gamefile_filter_json",
+        type=str,
+        default="",
+        help="Optional path to a JSON file with a gamefile_id whitelist "
+             "(either {\"gamefile_ids\": [...]} or a flat list of timestamp "
+             "ids). Only games whose extracted gid is in the whitelist are "
+             "rolled. Used by DAgger Phase 1 to roll the student on a specific "
+             "bucket (e.g. S35x64 part B's 64 games).",
     )
     return p.parse_args()
 
