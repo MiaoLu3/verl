@@ -16,9 +16,11 @@
 #   128 games / 1 rollout per part. Cumulative traj counts: 128, 256, 384,
 #   512, 640.
 #
-# Step counts at bs=64, 2 epochs:
-#   A         128 traj  →  4 steps
-#   A+B+C+D+E 640       → 20 steps
+# Step counts at bs=16, 2 epochs (bs=16 not 64 so the cosine schedule
+# has enough resolution; the bs=64 try only gave 4-20 total steps and
+# lr was already at floor by step 4):
+#   A         128 traj  → 16 steps
+#   A+B+C+D+E 640       → 80 steps
 #
 # Eval cost is independent of training-data size (8 rollouts × 140 games each),
 # so wall time is dominated by eval: ~30-50 min × 5 ≈ 4-5h. 8h SLURM budget.
@@ -78,7 +80,7 @@ SCHEME_VARIANT="1rollout"  # data dir suffix: ${SCHEME}_${SCHEME_VARIANT}_messag
 PARTS=(A B C D E)
 NUM_GPUS=${NUM_GPUS:-2}
 EPOCHS=${EPOCHS:-2}
-BS=${BS:-64}
+BS=${BS:-16}
 ROLLOUTS=${ROLLOUTS:-8}
 EXP_TAG=${EXP_TAG:-1r_v1}
 
